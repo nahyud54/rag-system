@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - FAST_API_HOST=0.0.0.0
+      - FAST_API_PORT=8000
+      - DEBUG=False
+      - LLM_MODEL=qwen2.5
+      - LLM_BASE_URL=http://ollama:11434
+      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+      - VECTOR_DB_TYPE=chroma
+      - VECTOR_DB_PATH=/app/data/chroma_db
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    depends_on:
+      - ollama
+    networks:
+      - rag-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rag_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_TIMEOUT=30000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    networks:
+      - rag-network
+    command: npm run dev
+
+  # Ollama for Local LLM
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - rag-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+
+volumes:
+  ollama_data:
+
+networks:
+  rag-network:
+    driver: bridge
+
+# Note: Before running docker-compose up:
+# 1. Create Dockerfile in backend directory
+# 2. Create Dockerfile in frontend directory
+# 3. Ensure .env files are configured
+#
+# To start all services:
+# docker-compose up -d
+#
+# To view logs:
+# docker-compose logs -f
+#
+# To stop services:
+# docker-compose down
