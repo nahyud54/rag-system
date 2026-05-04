@@ -1,137 +1,101 @@
-"""Stage 1: Indexing endpoints
+"""Stage 1: Indexing endpoints"""
 
-Endpoints for:
-- Crawling documents from URLs
-- ETL/preprocessing
-- Chunking
-- Embedding generation
-- Vector store operations
-"""
-
-from fastapi import APIRouter, HTTPException, UploadFile, File
-from pydantic import BaseModel
+import os
 from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File
+from pydantic import BaseModel
+
+from config import settings
+from dependencies import get_indexing_pipeline, get_vector_store
 
 router = APIRouter(prefix="/indexing", tags=["Indexing"])
 
+# Track background indexing jobs
+_indexing_status = {"status": "idle", "progress": None, "last_result": None}
+
+
+class IndexDirRequest(BaseModel):
+    directory: Optional[str] = None  # defaults to raw_pptx_path from config
+
 
 class CrawlRequest(BaseModel):
-    """Request model for crawling"""
     url: str
     course_name: str
     cookies: Optional[dict] = None
 
 
-class ExtractRequest(BaseModel):
-    """Request model for text extraction"""
-    file_path: str
-    file_type: str  # ppt, pptx, pdf
+def _run_indexing(directory: str):
+    global _indexing_status
+    _indexing_status["status"] = "running"
+    try:
+        pipeline = get_indexing_pipeline()
+        result = pipeline.index_directory(directory)
+        _indexing_status["status"] = "done"
+        _indexing_status["last_result"] = result
+    except Exception as e:
+        _indexing_status["status"] = "error"
+        _indexing_status["last_result"] = {"error": str(e)}
 
 
-class ChunkRequest(BaseModel):
-    """Request model for chunking"""
-    documents: List[dict]
-    chunk_size: Optional[int] = None
-    overlap: Optional[int] = None
+@router.post("/index-directory")
+async def index_directory(request: IndexDirRequest, background_tasks: BackgroundTasks):
+    """Index all PPTX files in a directory (runs in background)."""
+    directory = request.directory or settings.raw_pptx_path
+    if not os.path.isdir(directory):
+        raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+
+    global _indexing_status
+    if _indexing_status["status"] == "running":
+        raise HTTPException(status_code=409, detail="Indexing already in progress")
+
+    _indexing_status = {"status": "queued", "progress": None, "last_result": None}
+    background_tasks.add_task(_run_indexing, directory)
+    return {"status": "queued", "directory": directory}
 
 
-class EmbedRequest(BaseModel):
-    """Request model for embedding"""
-    texts: List[str]
+@router.post("/index-file")
+async def index_file(file: UploadFile = File(...)):
+    """Upload and index a single PPTX file."""
+    import tempfile, shutil
+    if not file.filename.endswith((".pptx", ".ppt")):
+        raise HTTPException(status_code=400, detail="Only .pptx/.ppt files accepted")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        pipeline = get_indexing_pipeline()
+        result = pipeline.index_file(tmp_path)
+        return {"status": "done", "filename": file.filename, **result}
+    finally:
+        os.unlink(tmp_path)
 
 
-@router.post("/crawl")
-async def crawl_documents(request: CrawlRequest):
-    """
-    Crawl documents from URL
-    
-    - **url**: URL to crawl
-    - **course_name**: Course/subject name for organization
-    - **cookies**: Optional authentication cookies
-    
-    Returns: Downloaded file information
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement crawling in stage1_indexing/crawling.py",
-        "details": request.dict(),
-    }
-
-
-@router.post("/extract")
-async def extract_text(file: UploadFile = File(...)):
-    """
-    Extract text from document (PPT/PPTX/PDF)
-    
-    - **file**: Document file to extract from
-    
-    Returns: Extracted text content
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement text extraction in stage1_indexing/etl.py",
-        "filename": file.filename,
-    }
-
-
-@router.post("/chunk")
-async def chunk_documents(request: ChunkRequest):
-    """
-    Chunk documents into smaller pieces
-    
-    - **documents**: List of documents to chunk
-    - **chunk_size**: Size of each chunk (default: 500)
-    - **overlap**: Overlap between chunks (default: 50)
-    
-    Returns: Chunked documents
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement chunking in stage1_indexing/chunking.py",
-        "chunk_count": len(request.documents),
-    }
-
-
-@router.post("/embed")
-async def generate_embeddings(request: EmbedRequest):
-    """
-    Generate embeddings for texts
-    
-    - **texts**: List of texts to embed
-    
-    Returns: Embeddings vectors
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement embedding in stage1_indexing/embedding.py",
-        "text_count": len(request.texts),
-    }
-
-
-@router.post("/store")
-async def store_vectors(embeddings: dict):
-    """
-    Store vectors in vector database
-    
-    - **embeddings**: Embeddings to store
-    
-    Returns: Storage confirmation
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement vector storage",
-    }
+@router.post("/reset")
+async def reset_index():
+    """Delete all indexed vectors and start fresh."""
+    vs = get_vector_store()
+    vs.reset()
+    return {"status": "reset", "message": "Vector store cleared"}
 
 
 @router.get("/status")
 async def indexing_status():
-    """
-    Get indexing status
-    
-    Returns: Current indexing statistics
-    """
-    return {
-        "status": "idle",
-        "indexed_documents": 0,
-        "last_update": None,
-    }
+    """Get current indexing status and vector store stats."""
+    vs = get_vector_store()
+    stats = vs.get_stats()
+    return {**_indexing_status, **stats}
+
+
+# --- Legacy stub endpoints kept for API compatibility ---
+
+@router.post("/crawl")
+async def crawl_documents(request: CrawlRequest):
+    return {"status": "not_implemented", "message": "Crawling endpoint – provide URL + cookies"}
+
+
+@router.post("/extract")
+async def extract_text(file: UploadFile = File(...)):
+    return {"status": "not_implemented", "filename": file.filename}

@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     chunk_overlap: int = 50
     min_chunk_size: int = 100
 
+    # Raw data path
+    raw_pptx_path: str = "../raw_pptx"
+
     # Crawling Configuration
     cookies_path: str = "./cookies.json"
     crawl_timeout: int = 30

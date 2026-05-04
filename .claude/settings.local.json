@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Administrator\\\\MAIN\\\\rag-system\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(ConvertTo-Csv -NoTypeInformation)",
+      "Bash(Write-Output)",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip --version)",
+      "Bash(python -m pip install -r requirements.txt)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(python -m json.tool)"
+    ]
+  }
+}

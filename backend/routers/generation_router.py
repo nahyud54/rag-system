@@ -1,111 +1,76 @@
-"""Stage 3: Generation endpoints
+"""Stage 3: Generation endpoints"""
 
-Endpoints for:
-- Context preparation and reordering
-- LLM-based answer generation
-- Output parsing and formatting
-"""
-
-from fastapi import APIRouter
-from pydantic import BaseModel
 from typing import List, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from dependencies import get_llm
+from stage3_generation.context import ContextPreparer
+from stage3_generation.parser import StrOutputParser
 
 router = APIRouter(prefix="/generation", tags=["Generation"])
 
+_context_preparer = ContextPreparer()
+_parser = StrOutputParser()
+
 
 class ContextRequest(BaseModel):
-    """Request model for context preparation"""
     documents: List[dict]
     query: str
     reorder_strategy: Optional[str] = "u_shape"
 
 
 class GenerateRequest(BaseModel):
-    """Request model for generation"""
     context: str
     query: str
-    model: Optional[str] = None
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 2048
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 
 class ParseRequest(BaseModel):
-    """Request model for output parsing"""
     text: str
-    parser_type: Optional[str] = "str_output"  # str_output, json, structured
 
 
 @router.post("/context")
 async def prepare_context(request: ContextRequest):
-    """
-    Prepare and reorder context documents
-    
-    Uses U-shape reordering:
-    - Important docs at start (higher relevance)
-    - Less important in middle
-    - Important docs at end (position bias)
-    
-    - **documents**: Retrieved documents
-    - **query**: Original query
-    - **reorder_strategy**: Reordering strategy (u_shape, linear, etc)
-    
-    Returns: Reordered and formatted context
-    """
+    """Prepare and U-shape reorder context from retrieved documents."""
+    context, ordered = _context_preparer.prepare(request.documents, request.reorder_strategy)
     return {
-        "status": "not_implemented",
-        "message": "Implement context preparation in stage3_generation/context.py",
-        "document_count": len(request.documents),
+        "context": context,
+        "ordered_documents": ordered,
+        "document_count": len(ordered),
+        "context_length": len(context),
     }
 
 
 @router.post("/generate")
 async def generate_answer(request: GenerateRequest):
-    """
-    Generate answer using LLM
-    
-    - **context**: Context from retrieved documents
-    - **query**: Original user query
-    - **model**: LLM model to use (default from config)
-    - **temperature**: Temperature for generation
-    - **max_tokens**: Maximum tokens to generate
-    
-    Returns: Generated answer
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement LLM generation in stage3_generation/llm.py",
-        "query": request.query,
-    }
+    """Generate answer using the configured LLM via Ollama."""
+    llm = get_llm()
+    if not llm.is_available():
+        raise HTTPException(status_code=503, detail="Ollama is not available")
+
+    prompt = llm.build_rag_prompt(request.query, request.context)
+    raw = llm.generate(prompt, temperature=request.temperature, max_tokens=request.max_tokens)
+    answer = _parser.parse(raw)
+    return {"query": request.query, "answer": answer}
 
 
 @router.post("/parse")
 async def parse_output(request: ParseRequest):
-    """
-    Parse and format LLM output
-    
-    - **text**: Raw LLM output text
-    - **parser_type**: Type of parser (str_output, json, structured)
-    
-    Returns: Parsed and formatted output
-    """
-    return {
-        "status": "not_implemented",
-        "message": "Implement output parsing in stage3_generation/parser.py",
-        "text_length": len(request.text),
-    }
+    """Clean and format raw LLM output."""
+    return {"parsed": _parser.parse(request.text)}
 
 
-@router.post("/validate")
-async def validate_output(output: dict):
-    """
-    Validate generated output
-    
-    - **output**: Generated output to validate
-    
-    Returns: Validation result
-    """
+@router.get("/llm-status")
+async def llm_status():
+    """Check if Ollama is running and list available models."""
+    llm = get_llm()
+    available = llm.is_available()
     return {
-        "status": "not_implemented",
-        "message": "Implement output validation",
-        "valid": True,
+        "available": available,
+        "base_url": llm.base_url,
+        "current_model": llm.model,
+        "models": llm.list_models() if available else [],
     }

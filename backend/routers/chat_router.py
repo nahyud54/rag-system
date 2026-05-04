@@ -1,31 +1,23 @@
-"""Stage 4: Application - Chat endpoints
+"""Stage 4: Chat endpoints - complete RAG pipeline with WebSocket streaming"""
 
-Complete RAG pipeline with chat interface
-Integrates all stages: Indexing → Retrieval → Generation
-"""
+import json
+import uuid
+from datetime import datetime
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, WebSocketDisconnect
 from fastapi.websockets import WebSocket
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
-import uuid
+
+from dependencies import get_rag_chain
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
-
-class Message(BaseModel):
-    """Message model"""
-    id: str
-    session_id: str
-    role: str  # user, assistant
-    content: str
-    timestamp: datetime
-    metadata: Optional[dict] = None
+# In-memory session storage
+sessions: dict = {}
 
 
 class ChatRequest(BaseModel):
-    """Chat message request"""
     session_id: Optional[str] = None
     query: str
     top_k: Optional[int] = 5
@@ -33,140 +25,139 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Chat message response"""
     session_id: str
     message_id: str
     query: str
     answer: str
     sources: Optional[List[dict]] = None
+    retrieved_count: int = 0
     timestamp: datetime
     metadata: Optional[dict] = None
 
 
-# In-memory session storage (use database in production)
-sessions = {}
+def _get_or_create_session(session_id: Optional[str]) -> str:
+    sid = session_id or str(uuid.uuid4())
+    if sid not in sessions:
+        sessions[sid] = {"created_at": datetime.utcnow(), "messages": []}
+    return sid
 
 
-@router.post("/message")
+@router.post("/message", response_model=ChatResponse)
 async def chat_message(request: ChatRequest) -> ChatResponse:
-    """
-    Send message and get RAG-powered response
-    
-    Complete pipeline:
-    1. Query embedding
-    2. Vector similarity search
-    3. Multi-query/HyDE/Re-ranking
-    4. Context preparation
-    5. LLM generation
-    6. Output parsing
-    
-    - **session_id**: Conversation session ID (auto-generated if not provided)
-    - **query**: User query/question
-    - **top_k**: Number of documents to retrieve
-    - **use_streaming**: Enable streaming response
-    
-    Returns: Generated answer with sources
-    """
-    # Generate session ID if not provided
-    session_id = request.session_id or str(uuid.uuid4())
+    """Send a message and get a RAG-powered response."""
+    session_id = _get_or_create_session(request.session_id)
     message_id = str(uuid.uuid4())
-    
-    # Initialize session if new
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "created_at": datetime.utcnow(),
-            "messages": [],
-        }
-    
+
+    rag = get_rag_chain()
+    result = rag.run(request.query)
+
+    msg_user = {"role": "user", "content": request.query, "timestamp": datetime.utcnow().isoformat()}
+    msg_assistant = {
+        "role": "assistant",
+        "content": result["answer"],
+        "sources": result.get("sources", []),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    sessions[session_id]["messages"].extend([msg_user, msg_assistant])
+
     return ChatResponse(
         session_id=session_id,
         message_id=message_id,
         query=request.query,
-        answer="Not implemented yet. Implement complete RAG pipeline in stage4_application/rag_chain.py",
-        sources=[],
+        answer=result["answer"],
+        sources=result.get("sources", []),
+        retrieved_count=result.get("retrieved_count", 0),
         timestamp=datetime.utcnow(),
-        metadata={
-            "status": "not_implemented",
-            "stage": "Integration of all 4 stages",
-        },
     )
 
 
 @router.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """
-    WebSocket endpoint for real-time chat
-    
-    - **session_id**: Conversation session ID
-    
-    Supports streaming responses and real-time updates
-    """
+    """WebSocket endpoint for streaming RAG responses token by token."""
     await websocket.accept()
+    _get_or_create_session(session_id)
+
     try:
         while True:
-            data = await websocket.receive_json()
-            # TODO: Implement streaming RAG pipeline
-            await websocket.send_json(
-                {
-                    "status": "not_implemented",
-                    "message": "WebSocket streaming not yet implemented",
-                }
-            )
+            data = await websocket.receive_text()
+            payload = json.loads(data)
+            query = payload.get("query", "")
+
+            if not query:
+                await websocket.send_json({"type": "error", "message": "Empty query"})
+                continue
+
+            rag = get_rag_chain()
+
+            # Retrieve + rerank first (non-streaming), then stream generation
+            try:
+                docs = rag._retrieve_and_rerank(query)
+                if not docs:
+                    await websocket.send_json({
+                        "type": "done",
+                        "answer": "Không tìm thấy thông tin liên quan.",
+                        "sources": [],
+                    })
+                    continue
+
+                context, ordered_docs = rag.context_preparer.prepare(docs)
+                prompt = rag.llm.build_rag_prompt(query, context)
+
+                full_answer = ""
+                for token in rag.llm.stream(prompt):
+                    full_answer += token
+                    await websocket.send_json({"type": "token", "token": token})
+
+                sources = [
+                    {
+                        "file": d.get("metadata", {}).get("file_name", ""),
+                        "slide": d.get("metadata", {}).get("slide_number", ""),
+                        "score": round(d.get("rerank_score", d.get("score", 0)), 3),
+                        "preview": d["text"][:150],
+                    }
+                    for d in ordered_docs
+                ]
+
+                sessions[session_id]["messages"].extend([
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": full_answer, "sources": sources},
+                ])
+
+                await websocket.send_json({"type": "done", "answer": full_answer, "sources": sources})
+
+            except RuntimeError as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+
     except WebSocketDisconnect:
-        print(f"Client disconnected: {session_id}")
+        pass
 
 
 @router.get("/history/{session_id}")
 async def get_chat_history(session_id: str, limit: int = 50):
-    """
-    Get chat history for a session
-    
-    - **session_id**: Session ID
-    - **limit**: Maximum number of messages to return
-    
-    Returns: List of messages in conversation
-    """
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    return {
-        "session_id": session_id,
-        "messages": sessions[session_id]["messages"][-limit:],
-    }
+    msgs = sessions[session_id]["messages"][-limit:]
+    return {"session_id": session_id, "messages": msgs, "total": len(msgs)}
 
 
 @router.delete("/history/{session_id}")
 async def clear_chat_history(session_id: str):
-    """
-    Clear chat history for a session
-    
-    - **session_id**: Session ID
-    
-    Returns: Confirmation message
-    """
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
     sessions[session_id]["messages"] = []
-    
-    return {"status": "success", "message": "Chat history cleared"}
+    return {"status": "cleared"}
 
 
 @router.get("/sessions")
 async def list_sessions():
-    """
-    List all active sessions
-    
-    Returns: List of active session IDs and metadata
-    """
     return {
-        "total_sessions": len(sessions),
+        "total": len(sessions),
         "sessions": [
             {
                 "session_id": sid,
-                "created_at": session["created_at"],
-                "message_count": len(session["messages"]),
+                "created_at": s["created_at"],
+                "message_count": len(s["messages"]),
             }
-            for sid, session in sessions.items()
+            for sid, s in sessions.items()
         ],
     }
